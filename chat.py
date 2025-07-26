@@ -2,14 +2,11 @@ import requests
 import json
 import time
 
-
-MODEL = 'gpt-4-1106-preview'
-
+MODEL = 'gpt-4.1'
 
 token = None
 
 messages = []
-
 
 def setup():
     resp = requests.post('https://github.com/login/device/code', headers={
@@ -55,7 +52,6 @@ def setup():
         f.write(access_token)
 
     print('Authentication success!')
-
 
 def get_token():
     global token
@@ -134,13 +130,10 @@ def chat(message):
         print(resp.text)
     return result
 
-
-
 def main():
     get_token()
     while True:
         print(chat(input('>>> ')))
-
 
 if __name__ == '__main__':
     main()
