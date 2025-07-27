@@ -61,3 +61,26 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "Hello!"}]
 )
 ```
+
+### Docker
+
+Run the API server using Docker:
+
+```bash
+# Build and start the service
+docker-compose up -d
+
+# View logs
+docker-compose logs -f copilot-api
+
+# Stop the service
+docker-compose down
+```
+
+The token will be stored persistently in the `./data` directory. On first run, you'll need to check the logs to complete the GitHub authentication:
+
+```bash
+docker-compose logs copilot-api
+```
+
+Follow the authentication URL and enter the code as instructed.

@@ -2,6 +2,7 @@ import requests
 import json
 import time
 import asyncio
+import os
 from typing import Optional, List, Dict, Any, AsyncGenerator
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,6 +29,9 @@ app.add_middleware(
 github_token = None
 copilot_token = None
 token_expiry = None
+
+# Token file path from environment or default
+TOKEN_PATH = os.getenv('COPILOT_TOKEN_PATH', '.copilot_token')
 
 # OpenAI-compatible request/response models
 class Message(BaseModel):
@@ -100,7 +104,8 @@ def setup():
             break
 
     # Save the access token to a file
-    with open('.copilot_token', 'w') as f:
+    os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
+    with open(TOKEN_PATH, 'w') as f:
         f.write(access_token)
 
     print('Authentication success!')
@@ -110,7 +115,7 @@ def get_github_token():
     """Get GitHub access token from file or setup"""
     global github_token
     try:
-        with open('.copilot_token', 'r') as f:
+        with open(TOKEN_PATH, 'r') as f:
             github_token = f.read().strip()
     except FileNotFoundError:
         github_token = setup()
