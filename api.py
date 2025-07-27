@@ -3,6 +3,7 @@ import json
 import time
 import asyncio
 import os
+import sys
 from typing import Optional, List, Dict, Any, AsyncGenerator
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -70,6 +71,8 @@ class ChatCompletionResponse(BaseModel):
 # Authentication functions from chat.py
 def setup():
     """Setup GitHub OAuth device flow authentication"""
+    logger.info("Starting GitHub OAuth device flow authentication...")
+    
     resp = requests.post('https://github.com/login/device/code', headers={
         'accept': 'application/json',
         'editor-version': 'Neovim/0.6.1',
@@ -84,9 +87,18 @@ def setup():
     user_code = resp_json.get('user_code')
     verification_uri = resp_json.get('verification_uri')
 
-    print(f'Please visit {verification_uri} and enter code {user_code} to authenticate.')
+    logger.critical(f'AUTHENTICATION REQUIRED: Please visit {verification_uri} and enter code {user_code}')
+    logger.critical(f'Waiting for authentication... (timeout: 5 minutes)')
+    sys.stdout.flush()  # Force flush to ensure Docker sees the logs
 
+    start_time = time.time()
+    timeout = 300  # 5 minutes timeout
+    
     while True:
+        if time.time() - start_time > timeout:
+            logger.error("Authentication timeout - no response received within 5 minutes")
+            raise HTTPException(status_code=408, detail="Authentication timeout. Please restart the authentication process.")
+            
         time.sleep(5)
         resp = requests.post('https://github.com/login/oauth/access_token', headers={
             'accept': 'application/json',
@@ -99,16 +111,34 @@ def setup():
 
         resp_json = resp.json()
         access_token = resp_json.get('access_token')
+        error = resp_json.get('error')
+        
+        if error == 'authorization_pending':
+            logger.debug("Authorization pending, checking again in 5 seconds...")
+        elif error:
+            logger.error(f"Authentication error: {error}")
+            raise HTTPException(status_code=400, detail=f"Authentication failed: {error}")
 
         if access_token:
             break
 
     # Save the access token to a file
-    os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
-    with open(TOKEN_PATH, 'w') as f:
-        f.write(access_token)
+    try:
+        token_dir = os.path.dirname(TOKEN_PATH)
+        if token_dir:  # Only create directory if path has a directory component
+            os.makedirs(token_dir, exist_ok=True)
+            logger.info(f"Created token directory: {token_dir}")
+        
+        with open(TOKEN_PATH, 'w') as f:
+            f.write(access_token)
+        logger.critical(f"Token saved successfully to {TOKEN_PATH}")
+        sys.stdout.flush()
+    except Exception as e:
+        logger.error(f"Failed to save token: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save authentication token: {str(e)}")
 
-    print('Authentication success!')
+    logger.critical('Authentication successful!')
+    sys.stdout.flush()
     return access_token
 
 def get_github_token():
@@ -136,8 +166,12 @@ def refresh_copilot_token():
         'user-agent': 'GithubCopilot/1.155.0'
     })
     
-    if resp.status_code != 200:
-        raise HTTPException(status_code=401, detail="Failed to get Copilot token")
+    if resp.status_code == 401:
+        logger.error("GitHub token is invalid or expired. Re-authentication required.")
+        raise HTTPException(status_code=401, detail="GitHub token is invalid. Please re-authenticate using POST /auth/device")
+    elif resp.status_code != 200:
+        logger.error(f"Failed to get Copilot token: {resp.status_code} - {resp.text}")
+        raise HTTPException(status_code=resp.status_code, detail=f"Failed to get Copilot token: {resp.text}")
     
     resp_json = resp.json()
     copilot_token = resp_json.get('token')
@@ -351,16 +385,102 @@ async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "service": "freegpt-api-proxy"}
 
+@app.post("/auth/device")
+async def start_device_auth():
+    """Start GitHub device authentication flow"""
+    try:
+        logger.info("Starting device authentication flow...")
+        
+        resp = requests.post('https://github.com/login/device/code', headers={
+            'accept': 'application/json',
+            'editor-version': 'Neovim/0.6.1',
+            'editor-plugin-version': 'copilot.vim/1.16.0',
+            'content-type': 'application/json',
+            'user-agent': 'GithubCopilot/1.155.0',
+            'accept-encoding': 'gzip,deflate,br'
+        }, data='{"client_id":"Iv1.b507a08c87ecfe98","scope":"read:user"}')
+        
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail=f"GitHub API error: {resp.text}")
+        
+        resp_json = resp.json()
+        device_code = resp_json.get('device_code')
+        user_code = resp_json.get('user_code')
+        verification_uri = resp_json.get('verification_uri')
+        expires_in = resp_json.get('expires_in', 900)
+        
+        return {
+            "device_code": device_code,
+            "user_code": user_code,
+            "verification_uri": verification_uri,
+            "expires_in": expires_in,
+            "message": f"Please visit {verification_uri} and enter code {user_code}"
+        }
+    except Exception as e:
+        logger.error(f"Failed to start device auth: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/auth/device/{device_code}/complete")
+async def complete_device_auth(device_code: str):
+    """Complete GitHub device authentication flow"""
+    try:
+        resp = requests.post('https://github.com/login/oauth/access_token', headers={
+            'accept': 'application/json',
+            'editor-version': 'Neovim/0.6.1',
+            'editor-plugin-version': 'copilot.vim/1.16.0',
+            'content-type': 'application/json',
+            'user-agent': 'GithubCopilot/1.155.0',
+            'accept-encoding': 'gzip,deflate,br'
+        }, data=f'{{"client_id":"Iv1.b507a08c87ecfe98","device_code":"{device_code}","grant_type":"urn:ietf:params:oauth:grant-type:device_code"}}')
+        
+        resp_json = resp.json()
+        access_token = resp_json.get('access_token')
+        error = resp_json.get('error')
+        
+        if error:
+            return {"status": "pending", "error": error}
+        
+        if access_token:
+            # Save the token
+            global github_token
+            github_token = access_token
+            
+            try:
+                token_dir = os.path.dirname(TOKEN_PATH)
+                if token_dir:
+                    os.makedirs(token_dir, exist_ok=True)
+                
+                with open(TOKEN_PATH, 'w') as f:
+                    f.write(access_token)
+                    
+                logger.info("Authentication completed successfully")
+                return {"status": "completed", "message": "Authentication successful"}
+            except Exception as e:
+                logger.error(f"Failed to save token: {e}")
+                return {"status": "error", "message": f"Authentication successful but failed to save token: {str(e)}"}
+                
+        return {"status": "pending", "message": "Authentication still pending"}
+        
+    except Exception as e:
+        logger.error(f"Failed to complete device auth: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize on startup"""
     logger.info("Starting FreeGPT API Proxy...")
-    try:
-        get_github_token()
-        logger.info("GitHub token loaded successfully")
-    except Exception as e:
-        logger.warning(f"Failed to load GitHub token on startup: {e}")
-        logger.info("Token will be obtained on first request")
+    logger.info(f"Token path: {TOKEN_PATH}")
+    sys.stdout.flush()
+    
+    # Check if token exists but don't try to authenticate at startup
+    if os.path.exists(TOKEN_PATH):
+        logger.info("Token file found. Will validate on first request.")
+    else:
+        logger.critical("No token file found. Authentication required.")
+        logger.critical("To authenticate:")
+        logger.critical("1. Use POST /auth/device to start authentication")
+        logger.critical("2. Or make an API request to trigger automatic authentication")
+        sys.stdout.flush()
 
 if __name__ == "__main__":
     import uvicorn
