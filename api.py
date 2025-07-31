@@ -4,12 +4,13 @@ import time
 import asyncio
 import os
 import sys
-from typing import Optional, List, Dict, Any, AsyncGenerator
+from typing import Optional, List, Dict, Any, AsyncGenerator, Union
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 import logging
+import ollama
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -34,10 +35,17 @@ token_expiry = None
 # Token file path from environment or default
 TOKEN_PATH = os.getenv('COPILOT_TOKEN_PATH', '.copilot_token')
 
+# Ollama host configuration
+OLLAMA_HOST = os.getenv('OLLAMA_HOST', 'http://localhost:11434')
+
 # OpenAI-compatible request/response models
 class Message(BaseModel):
     role: str
     content: str
+
+class ResponseFormat(BaseModel):
+    type: str  # "json_object" or "json_schema"
+    json_schema: Optional[Dict[str, Any]] = None
 
 class ChatCompletionRequest(BaseModel):
     model: str = Field(default="gpt-4")
@@ -49,6 +57,7 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = Field(default=None)
     presence_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
     frequency_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
+    response_format: Optional[ResponseFormat] = None
 
 class ChatCompletionChoice(BaseModel):
     index: int
@@ -67,6 +76,27 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: List[ChatCompletionChoice]
     usage: UsageStats = Field(default_factory=lambda: UsageStats())
+
+class EmbeddingRequest(BaseModel):
+    input: Union[str, List[str]]
+    model: str = Field(default="text-embedding-3-small")
+    encoding_format: Optional[str] = Field(default="float")
+    user: Optional[str] = None
+
+class EmbeddingData(BaseModel):
+    object: str = "embedding"
+    embedding: List[float]
+    index: int
+
+class EmbeddingUsage(BaseModel):
+    prompt_tokens: int
+    total_tokens: int
+
+class EmbeddingResponse(BaseModel):
+    object: str = "list"
+    data: List[EmbeddingData]
+    model: str
+    usage: EmbeddingUsage
 
 # Authentication functions from chat.py
 def setup():
@@ -189,17 +219,6 @@ def ensure_valid_token():
     
     return copilot_token
 
-# Map OpenAI models to Copilot models
-def map_model(openai_model: str) -> str:
-    """Map OpenAI model names to Copilot model names"""
-    model_mapping = {
-        "gpt-4": "gpt-4.1",
-        "gpt-4-turbo": "gpt-4.1",
-        "gpt-4-turbo-preview": "gpt-4.1",
-        "gpt-3.5-turbo": "gpt-3.5-turbo",
-    }
-    return model_mapping.get(openai_model, "gpt-4.1")
-
 async def stream_copilot_response(resp) -> AsyncGenerator[str, None]:
     """Convert Copilot streaming response to OpenAI format"""
     async def read_stream():
@@ -266,13 +285,10 @@ async def chat_completions(request: ChatCompletionRequest):
         # Convert messages to format expected by Copilot
         messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
         
-        # Map model name
-        copilot_model = map_model(request.model)
-        
         # Prepare request to Copilot
         copilot_request = {
             'intent': False,
-            'model': copilot_model,
+            'model': request.model,
             'temperature': request.temperature,
             'top_p': request.top_p,
             'n': request.n,
@@ -280,6 +296,14 @@ async def chat_completions(request: ChatCompletionRequest):
             'messages': messages
         }
         
+        # Add response_format if provided
+        if request.response_format:
+            copilot_request['response_format'] = {
+                'type': request.response_format.type
+            }
+            if request.response_format.json_schema:
+                copilot_request['response_format']['json_schema'] = request.response_format.json_schema
+
         # Make request to Copilot
         resp = requests.post('https://api.githubcopilot.com/chat/completions', 
             headers={
@@ -385,6 +409,84 @@ async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "service": "freegpt-api-proxy"}
 
+@app.post("/v1/embeddings")
+async def create_embeddings(request: EmbeddingRequest):
+    """OpenAI-compatible embeddings endpoint using Ollama"""
+    try:
+        # Create Ollama client with configured host
+        client = ollama.Client(host=OLLAMA_HOST)
+        
+        # Normalize input to list
+        if isinstance(request.input, str):
+            inputs = [request.input]
+        else:
+            inputs = request.input
+        
+        # Use the model from the request
+        ollama_model = request.model
+        
+        embeddings_data = []
+        total_tokens = 0
+        
+        # Generate embeddings for each input
+        for idx, text in enumerate(inputs):
+            try:
+                # Call Ollama embeddings API with client
+                response = client.embeddings(
+                    model=ollama_model,
+                    prompt=text
+                )
+                
+                # Extract embedding from response
+                embedding = response.get('embedding', [])
+                
+                # Create embedding data object
+                embeddings_data.append(EmbeddingData(
+                    object="embedding",
+                    embedding=embedding,
+                    index=idx
+                ))
+                
+                # Rough token estimation (4 chars per token)
+                total_tokens += len(text) // 4
+                
+            except Exception as e:
+                logger.error(f"Error generating embedding for input {idx}: {str(e)}")
+                # Check if Ollama is running
+                if "connection" in str(e).lower() or "refused" in str(e).lower():
+                    error_msg = f"Cannot connect to Ollama at {OLLAMA_HOST}. "
+                    if "docker" in OLLAMA_HOST.lower() or OLLAMA_HOST != "http://localhost:11434":
+                        error_msg += "When running in Docker, ensure OLLAMA_HOST is set correctly (e.g., 'host.docker.internal:11434' for Mac/Windows)"
+                    else:
+                        error_msg += "Please ensure Ollama is installed and running with 'ollama serve'"
+                    raise HTTPException(
+                        status_code=503,
+                        detail=error_msg
+                    )
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to generate embedding: {str(e)}"
+                )
+        
+        # Create response
+        response = EmbeddingResponse(
+            object="list",
+            data=embeddings_data,
+            model=request.model,
+            usage=EmbeddingUsage(
+                prompt_tokens=total_tokens,
+                total_tokens=total_tokens
+            )
+        )
+        
+        return response.model_dump()
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in embeddings endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/auth/device")
 async def start_device_auth():
     """Start GitHub device authentication flow"""
@@ -470,6 +572,7 @@ async def startup_event():
     """Initialize on startup"""
     logger.info("Starting FreeGPT API Proxy...")
     logger.info(f"Token path: {TOKEN_PATH}")
+    logger.info(f"Ollama host: {OLLAMA_HOST}")
     sys.stdout.flush()
     
     # Check if token exists but don't try to authenticate at startup
