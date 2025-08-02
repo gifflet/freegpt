@@ -1,6 +1,7 @@
 services:
   copilot-api:
     build: .
+    image: gifflet/copilot-api:latest
     container_name: copilot-api
     ports:
       - "9000:8000"
